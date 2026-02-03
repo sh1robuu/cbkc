@@ -67,7 +67,7 @@ RETURNS BOOLEAN AS $$
 DECLARE
     avail counselor_availability%ROWTYPE;
     current_day TEXT;
-    current_time TIME;
+    curr_time TIME;
     day_schedule JSONB;
     slot JSONB;
     override_entry JSONB;
@@ -102,7 +102,7 @@ BEGIN
     -- Check weekly schedule
     current_day := lower(to_char(CURRENT_DATE, 'Day'));
     current_day := trim(current_day); -- Remove trailing spaces
-    current_time := CURRENT_TIME;
+    curr_time := LOCALTIME;
     
     day_schedule := avail.weekly_schedule->current_day;
     
@@ -114,7 +114,7 @@ BEGIN
     -- Check if current time is within any slot
     FOR slot IN SELECT * FROM jsonb_array_elements(day_schedule)
     LOOP
-        IF current_time >= (slot->>'start')::TIME AND current_time <= (slot->>'end')::TIME THEN
+        IF curr_time >= (slot->>'start')::TIME AND curr_time <= (slot->>'end')::TIME THEN
             RETURN TRUE;
         END IF;
     END LOOP;

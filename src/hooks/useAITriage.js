@@ -1,120 +1,151 @@
 /**
- * useAITriage Hook
- * Manages AI initial triage conversation in chat rooms
+ * useAITriage Hook - Enhanced
+ * Manages AI conversation with students and real-time assessment
  */
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { supabase } from '../lib/supabaseClient'
 import {
-    getWelcomeMessage,
-    getAIQuestions,
-    getWaitMessage,
+    generateAIResponse,
+    generateStudentAssessment,
     shouldAIRespond,
-    analyzeUrgency
+    getWelcomeMessage,
+    getUrgencyConfig
 } from '../lib/aiTriage'
-
-const AI_SENDER_ID = 'ai-assistant' // Special ID for AI messages
 
 export function useAITriage(chatRoomId, chatRoom) {
     const [isProcessing, setIsProcessing] = useState(false)
-    const questionIndexRef = useRef(0)
+    const [assessment, setAssessment] = useState(null)
+    const conversationHistoryRef = useRef([])
+    const hasInitializedRef = useRef(false)
 
     /**
      * Send AI message to chat
      */
-    const sendAIMessage = useCallback(async (content) => {
+    const sendAIMessage = useCallback(async (content, assessmentData = null) => {
         try {
-            await supabase
-                .from('chat_messages')
-                .insert({
-                    chat_room_id: chatRoomId,
-                    sender_id: null, // NULL indicates system/AI message
-                    content: content,
-                    is_system: true,
-                    metadata: { type: 'ai_triage' }
-                })
+            const messageData = {
+                chat_room_id: chatRoomId,
+                sender_id: null, // NULL indicates system/AI message
+                content: content,
+                is_system: true,
+                metadata: {
+                    type: 'ai_triage',
+                    sender_name: 'Tâm An',
+                    assessment: assessmentData
+                }
+            }
+
+            await supabase.from('chat_messages').insert(messageData)
+
+            // Track in conversation history
+            conversationHistoryRef.current.push({
+                content,
+                isAI: true
+            })
         } catch (error) {
             console.error('Error sending AI message:', error)
         }
     }, [chatRoomId])
 
     /**
-     * Initialize AI triage when chat room is created
+     * Update chat room with assessment data
+     */
+    const updateChatRoomAssessment = useCallback(async (assessmentData) => {
+        if (!assessmentData || !chatRoomId) return
+
+        try {
+            await supabase
+                .from('chat_rooms')
+                .update({
+                    urgency_level: assessmentData.urgencyLevel,
+                    ai_assessment: assessmentData,
+                    ai_triage_complete: assessmentData.urgencyLevel >= 0
+                })
+                .eq('id', chatRoomId)
+
+            setAssessment(assessmentData)
+        } catch (error) {
+            console.error('Error updating chat room assessment:', error)
+        }
+    }, [chatRoomId])
+
+    /**
+     * Initialize AI conversation when chat room is created
      */
     const initializeTriage = useCallback(async () => {
-        if (!chatRoom || chatRoom.ai_triage_complete || chatRoom.counselor_first_reply_at) {
-            return
-        }
+        if (!chatRoom || hasInitializedRef.current) return
+        if (chatRoom.counselor_first_reply_at) return
 
+        hasInitializedRef.current = true
         setIsProcessing(true)
 
         // Send welcome message
         await sendAIMessage(getWelcomeMessage())
 
-        // Wait a bit then send first question
-        setTimeout(async () => {
-            const questions = getAIQuestions()
-            if (questions.length > 0) {
-                await sendAIMessage(questions[0])
-                questionIndexRef.current = 1
-            }
-            setIsProcessing(false)
-        }, 1500)
+        setIsProcessing(false)
     }, [chatRoom, sendAIMessage])
 
     /**
-     * Process student message and respond accordingly
+     * Process student message and generate AI response
      */
-    const processStudentMessage = useCallback(async (messageContent, allStudentMessages) => {
+    const processStudentMessage = useCallback(async (messageContent) => {
         if (!chatRoom || !shouldAIRespond(chatRoom)) {
             return
         }
 
+        // Add to conversation history
+        conversationHistoryRef.current.push({
+            content: messageContent,
+            isAI: false
+        })
+
         setIsProcessing(true)
-        const questions = getAIQuestions()
 
-        // Check if we need to ask more questions
-        if (questionIndexRef.current < questions.length) {
-            // Wait a bit then ask next question
-            setTimeout(async () => {
-                await sendAIMessage(questions[questionIndexRef.current])
-                questionIndexRef.current++
-                setIsProcessing(false)
-            }, 1000)
-        } else {
-            // All questions answered, analyze and complete triage
-            try {
-                const { urgencyLevel, reasoning } = await analyzeUrgency(allStudentMessages)
+        try {
+            // Generate AI response with assessment
+            const { response, assessment: newAssessment } = await generateAIResponse(
+                conversationHistoryRef.current,
+                messageContent
+            )
 
-                // Update chat room with urgency level
-                await supabase
-                    .from('chat_rooms')
-                    .update({
-                        urgency_level: urgencyLevel,
-                        ai_triage_complete: true
-                    })
-                    .eq('id', chatRoomId)
+            // Send AI response
+            await sendAIMessage(response, newAssessment)
 
-                // Send closing message
-                await sendAIMessage(getWaitMessage())
+            // Update chat room if we have assessment data
+            if (newAssessment) {
+                await updateChatRoomAssessment(newAssessment)
 
-                // If high urgency, send additional message
-                if (urgencyLevel >= 2) {
-                    setTimeout(async () => {
-                        await sendAIMessage(
-                            `⚠️ Dựa trên những gì bạn chia sẻ, mình đã đánh dấu cuộc trò chuyện này là ${urgencyLevel === 3 ? 'rất khẩn cấp' : 'khẩn cấp'
-                            } để tư vấn viên ưu tiên hỗ trợ bạn.`
-                        )
-                    }, 1500)
+                // If high urgency, generate full assessment
+                if (newAssessment.urgencyLevel >= 2 || newAssessment.suicideRisk !== 'none') {
+                    // Notify about urgency
+                    if (newAssessment.suicideRisk === 'high') {
+                        setTimeout(async () => {
+                            await sendAIMessage(
+                                '⚠️ Mình hiểu bạn đang trải qua thời điểm rất khó khăn. Tư vấn viên sẽ liên hệ với bạn ngay lập tức. Trong lúc chờ đợi, hãy nhớ rằng bạn không đơn độc và việc tìm kiếm sự giúp đỡ là điều rất dũng cảm. ❤️'
+                            )
+                        }, 1000)
+                    }
                 }
-
-                console.log('AI Triage complete:', { urgencyLevel, reasoning })
-            } catch (error) {
-                console.error('Error completing triage:', error)
             }
-
-            setIsProcessing(false)
+        } catch (error) {
+            console.error('Error processing student message:', error)
         }
-    }, [chatRoom, chatRoomId, sendAIMessage])
+
+        setIsProcessing(false)
+    }, [chatRoom, sendAIMessage, updateChatRoomAssessment])
+
+    /**
+     * Refresh full assessment (for counselors)
+     */
+    const refreshAssessment = useCallback(async (messages) => {
+        if (!messages || messages.length === 0) return
+
+        const fullAssessment = await generateStudentAssessment(messages)
+        if (fullAssessment) {
+            await updateChatRoomAssessment(fullAssessment)
+        }
+        return fullAssessment
+    }, [updateChatRoomAssessment])
 
     /**
      * Check if a message is from AI
@@ -123,11 +154,27 @@ export function useAITriage(chatRoomId, chatRoom) {
         return message.is_system && message.metadata?.type === 'ai_triage'
     }
 
+    /**
+     * Get AI sender name
+     */
+    const getAISenderName = () => 'Tâm An'
+
     return {
+        // Actions
         initializeTriage,
         processStudentMessage,
+        refreshAssessment,
+
+        // State
         isProcessing,
+        assessment,
+
+        // Helpers
         isAIMessage,
-        shouldAIRespond: shouldAIRespond(chatRoom || {})
+        getAISenderName,
+        shouldAIRespond: shouldAIRespond(chatRoom || {}),
+        getUrgencyConfig
     }
 }
+
+export default useAITriage
